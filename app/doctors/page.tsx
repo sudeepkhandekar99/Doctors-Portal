@@ -18,6 +18,24 @@ const AUTH_KEY = '__clinibooth_tokens__';
 
 type Gender = 'M' | 'F' | 'X';
 
+type DoctorAdditionalInfo = {
+  id: number;
+  doctor_id: number;
+  profile_photo?: string | null;
+  title: string;
+  speciality: string;
+  work_experience: number;
+  npi_number?: string | null;
+  qualification?: string | null;
+} | null;
+
+type DoctorStateRow = {
+  id: number;
+  doctor_id: number;
+  /** CSV string like "VA,DC,MD" */
+  state_codes: string;
+};
+
 type DoctorOut = {
   id: number;
   email: string;
@@ -26,17 +44,9 @@ type DoctorOut = {
   last_name?: string | null;
   gender?: Gender | null;
   dob?: string | null; // "YYYY-MM-DD"
-  additional_info?: {
-    id: number;
-    doctor_id: number;
-    profile_photo?: string | null;
-    title: string;
-    speciality: string;
-    work_experience: number;
-    npi_number?: string | null;
-    qualification?: string | null;
-  } | null;
-  states: { id: number; doctor_id: number; state_code: string }[];
+  additional_info?: DoctorAdditionalInfo;
+  /** Backend returns an array; first row contains CSV `state_codes` */
+  states: DoctorStateRow[];
 };
 
 type DoctorCreatePayload = {
@@ -55,34 +65,47 @@ type DoctorCreatePayload = {
     npi_number?: string | null;
     qualification?: string | null;
   };
-  states?: { state_code: string }[];
+  /** FIX: states must be a LIST */
+  states?: { state_codes: string }[];
 };
 
 type DoctorUpdatePayload = Partial<Omit<DoctorCreatePayload, 'password'>> & {
-  states?: { state_code: string }[];
+  /** FIX: states must be a LIST */
+  states?: { state_codes: string }[];
 };
 
-function authHeaders() {
+// Build a single Authorization header string (or null)
+function getAuthHeader(): string | null {
   try {
     const raw = localStorage.getItem(AUTH_KEY);
-    if (!raw) return {};
+    if (!raw) return null;
     const tok = JSON.parse(raw) as { access_token?: string; token_type?: string };
-    if (!tok?.access_token) return {};
-    return {
-      Authorization: `${tok.token_type || 'Bearer'} ${tok.access_token}`,
-    };
+    if (!tok?.access_token) return null;
+    const type = tok.token_type || 'Bearer';
+    return `${type} ${tok.access_token}`;
   } catch {
-    return {};
+    return null;
   }
 }
 
-function parseStatesCSV(csv: string): { state_code: string }[] | undefined {
+// Normalize CSV: uppercase, trim, remove spaces, dedupe, keep stable order
+function normalizeStatesCSV(csv: string): string | undefined {
   const items = csv
     .split(',')
     .map(s => s.trim().toUpperCase())
     .filter(Boolean);
+
   if (items.length === 0) return undefined;
-  return Array.from(new Set(items)).map(code => ({ state_code: code }));
+
+  const seen = new Set<string>();
+  const orderedUnique: string[] = [];
+  for (const it of items) {
+    if (!seen.has(it)) {
+      seen.add(it);
+      orderedUnique.push(it);
+    }
+  }
+  return orderedUnique.join(',');
 }
 
 export default function DoctorsPage() {
@@ -99,8 +122,9 @@ export default function DoctorsPage() {
     gender: 'M' as Gender,
     dob: '',
     password: 'password',
-    // optional extras:
+    // states as CSV in UI
     statesCSV: '',
+    // optional extras:
     title: '',
     speciality: '',
     work_experience: '', // keep as string in UI; cast before send
@@ -119,7 +143,9 @@ export default function DoctorsPage() {
     last_name: '',
     gender: 'M' as Gender,
     dob: '',
+    // states as CSV in UI
     statesCSV: '',
+    // optional AI
     title: '',
     speciality: '',
     work_experience: '',
@@ -134,12 +160,11 @@ export default function DoctorsPage() {
   async function fetchDoctors() {
     setLoading(true);
     try {
-      const res = await fetch(`${API}?limit=200`, {
-        headers: {
-          accept: 'application/json',
-          ...authHeaders(),
-        },
-      });
+      const headers: Record<string, string> = { accept: 'application/json' };
+      const auth = getAuthHeader();
+      if (auth) headers.Authorization = auth;
+
+      const res = await fetch(`${API}?limit=200`, { headers });
       if (!res.ok) throw new Error(`List failed ${res.status}`);
       const data = (await res.json()) as DoctorOut[];
       setDoctors(Array.isArray(data) ? data : []);
@@ -156,11 +181,7 @@ export default function DoctorsPage() {
   }, []);
 
   function buildCreatePayload(): DoctorCreatePayload {
-    const states = parseStatesCSV(createForm.statesCSV);
-    const hasAI =
-      createForm.title.trim() &&
-      createForm.speciality.trim() &&
-      createForm.work_experience.trim();
+    const csv = normalizeStatesCSV(createForm.statesCSV);
 
     const payload: DoctorCreatePayload = {
       email: createForm.email.trim(),
@@ -170,8 +191,17 @@ export default function DoctorsPage() {
       gender: (createForm.gender as Gender) || undefined,
       dob: createForm.dob || undefined,
       password: createForm.password || 'root',
-      ...(states ? { states } : {}),
     };
+
+    if (csv) {
+      // FIX: backend expects an array
+      payload.states = [{ state_codes: csv }];
+    }
+
+    const hasAI =
+      createForm.title.trim() &&
+      createForm.speciality.trim() &&
+      createForm.work_experience.trim();
 
     if (hasAI) {
       payload.additional_info = {
@@ -190,7 +220,7 @@ export default function DoctorsPage() {
   async function handleCreate() {
     try {
       const body = buildCreatePayload();
-      // Basic client check:
+      // Basic client checks
       if (!body.email) {
         alert('Email is required');
         return;
@@ -200,13 +230,16 @@ export default function DoctorsPage() {
         return;
       }
 
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        accept: 'application/json',
+      };
+      const auth = getAuthHeader();
+      if (auth) headers.Authorization = auth;
+
       const res = await fetch(API, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          accept: 'application/json',
-          ...authHeaders(),
-        },
+        headers,
         body: JSON.stringify(body),
       });
 
@@ -240,6 +273,7 @@ export default function DoctorsPage() {
   }
 
   function openEdit(d: DoctorOut) {
+    const csv = (d.states && d.states.length > 0) ? d.states[0].state_codes : '';
     setEditing(d);
     setEditForm({
       email: d.email || '',
@@ -248,7 +282,7 @@ export default function DoctorsPage() {
       last_name: d.last_name || '',
       gender: (d.gender as Gender) || 'M',
       dob: d.dob || '',
-      statesCSV: (d.states || []).map(s => s.state_code).join(','),
+      statesCSV: csv, // directly from state_codes CSV
       title: d.additional_info?.title || '',
       speciality: d.additional_info?.speciality || '',
       work_experience: d.additional_info?.work_experience != null ? String(d.additional_info.work_experience) : '',
@@ -260,11 +294,7 @@ export default function DoctorsPage() {
   }
 
   function buildUpdatePayload(): DoctorUpdatePayload {
-    const states = parseStatesCSV(editForm.statesCSV);
-    const hasAI =
-      editForm.title.trim() &&
-      editForm.speciality.trim() &&
-      editForm.work_experience.trim();
+    const csv = normalizeStatesCSV(editForm.statesCSV);
 
     const payload: DoctorUpdatePayload = {
       email: editForm.email.trim(),
@@ -273,8 +303,17 @@ export default function DoctorsPage() {
       last_name: editForm.last_name.trim() || undefined,
       gender: (editForm.gender as Gender) || undefined,
       dob: editForm.dob || undefined,
-      ...(states ? { states } : {}),
     };
+
+    if (csv) {
+      // FIX: backend expects an array
+      payload.states = [{ state_codes: csv }];
+    }
+
+    const hasAI =
+      editForm.title.trim() &&
+      editForm.speciality.trim() &&
+      editForm.work_experience.trim();
 
     if (hasAI) {
       payload.additional_info = {
@@ -299,13 +338,16 @@ export default function DoctorsPage() {
         return;
       }
 
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        accept: 'application/json',
+      };
+      const auth = getAuthHeader();
+      if (auth) headers.Authorization = auth;
+
       const res = await fetch(`${API}/${editing.id}`, {
         method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          accept: 'application/json',
-          ...authHeaders(),
-        },
+        headers,
         body: JSON.stringify(body),
       });
 
@@ -324,13 +366,15 @@ export default function DoctorsPage() {
   async function deleteDoctor() {
     if (!doctorToDelete) return;
     try {
+      const headers: Record<string, string> = { accept: 'application/json' };
+      const auth = getAuthHeader();
+      if (auth) headers.Authorization = auth;
+
       const res = await fetch(`${API}/${doctorToDelete.id}`, {
         method: 'DELETE',
-        headers: {
-          accept: 'application/json',
-          ...authHeaders(),
-        },
+        headers,
       });
+
       if (!res.ok && res.status !== 204) {
         const txt = await res.text().catch(() => '');
         throw new Error(txt || `Delete failed (${res.status})`);
@@ -397,7 +441,7 @@ export default function DoctorsPage() {
                 onChange={(e) => setCreateForm({ ...createForm, password: e.target.value })}
               />
 
-              <Input placeholder="States CSV (e.g., VA, MD, DC)"
+              <Input placeholder="States CSV (e.g., VA,MD,DC)"
                 value={createForm.statesCSV}
                 onChange={(e) => setCreateForm({ ...createForm, statesCSV: e.target.value })}
               />
@@ -458,50 +502,52 @@ export default function DoctorsPage() {
               </tr>
             </thead>
             <tbody>
-              {doctors.map((d) => (
-                <tr key={d.id} className="text-center">
-                  <td className="border px-3 py-2">{d.id}</td>
-                  <td className="border px-3 py-2">{d.email}</td>
-                  <td className="border px-3 py-2">{d.phone || '-'}</td>
-                  <td className="border px-3 py-2">{d.first_name || '-'}</td>
-                  <td className="border px-3 py-2">{d.last_name || '-'}</td>
-                  <td className="border px-3 py-2">{d.gender || '-'}</td>
-                  <td className="border px-3 py-2">{d.dob || '-'}</td>
-                  <td className="border px-3 py-2">
-                    {(d.states || []).map(s => s.state_code).join(', ') || '-'}
-                  </td>
-                  <td className="border px-3 py-2">
-                    <div className="flex gap-2 justify-center">
-                      <Button variant="outline" size="sm" onClick={() => openEdit(d)}>Edit</Button>
+              {doctors.map((d) => {
+                const csv = (d.states && d.states.length > 0) ? d.states[0].state_codes : '';
+                const pretty = csv ? csv.split(',').join(', ') : '-';
+                return (
+                  <tr key={d.id} className="text-center">
+                    <td className="border px-3 py-2">{d.id}</td>
+                    <td className="border px-3 py-2">{d.email}</td>
+                    <td className="border px-3 py-2">{d.phone || '-'}</td>
+                    <td className="border px-3 py-2">{d.first_name || '-'}</td>
+                    <td className="border px-3 py-2">{d.last_name || '-'}</td>
+                    <td className="border px-3 py-2">{d.gender || '-'}</td>
+                    <td className="border px-3 py-2">{d.dob || '-'}</td>
+                    <td className="border px-3 py-2">{pretty}</td>
+                    <td className="border px-3 py-2">
+                      <div className="flex gap-2 justify-center">
+                        <Button variant="outline" size="sm" onClick={() => openEdit(d)}>Edit</Button>
 
-                      <AlertDialog>
-                        <AlertDialogTrigger asChild>
-                          <Button
-                            variant="destructive"
-                            size="sm"
-                            onClick={() => setDoctorToDelete(d)}
-                          >
-                            Delete
-                          </Button>
-                        </AlertDialogTrigger>
-                        <AlertDialogContent>
-                          <AlertDialogHeader>
-                            <AlertDialogTitle>
-                              Delete {doctorToDelete?.first_name || doctorToDelete?.email}?
-                            </AlertDialogTitle>
-                          </AlertDialogHeader>
-                          <AlertDialogFooter>
-                            <AlertDialogCancel>Cancel</AlertDialogCancel>
-                            <AlertDialogAction onClick={deleteDoctor}>
-                              Confirm Delete
-                            </AlertDialogAction>
-                          </AlertDialogFooter>
-                        </AlertDialogContent>
-                      </AlertDialog>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              onClick={() => setDoctorToDelete(d)}
+                            >
+                              Delete
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>
+                                Delete {doctorToDelete?.first_name || doctorToDelete?.email}?
+                              </AlertDialogTitle>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancel</AlertDialogCancel>
+                              <AlertDialogAction onClick={deleteDoctor}>
+                                Confirm Delete
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -547,7 +593,7 @@ export default function DoctorsPage() {
               />
             </div>
 
-            <Input placeholder="States CSV (e.g., VA, MD, DC)"
+            <Input placeholder="States CSV (e.g., VA,MD,DC)"
               value={editForm.statesCSV}
               onChange={(e) => setEditForm({ ...editForm, statesCSV: e.target.value })}
             />
